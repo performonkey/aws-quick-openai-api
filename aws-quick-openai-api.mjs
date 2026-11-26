@@ -732,8 +732,32 @@ async function runCredsCommand(flags) {
 
 const TOOL_CALL_OPEN = '<qw_tool_call>';
 const TOOL_CALL_CLOSE = '</qw_tool_call>';
-// Quick WS 原始帧限制 64KB（含 Base64 4/3 膨胀及 JSON 包装），安全文本上限设为 42KB
+// Quick WS 原始帧限制 64KB，单条安全文本上限设为 42KB；超出时自动拆分为多条消息发送
 const MAX_QUICK_PROMPT_BYTES = 42 * 1024;
+const MAX_PROMPT_CHUNKS = 8;
+
+function splitUtf8ByMaxBytes(str, maxBytes) {
+  if (Buffer.byteLength(str, 'utf8') <= maxBytes) return [str];
+  const chunks = [];
+  let remaining = str;
+  while (Buffer.byteLength(remaining, 'utf8') > maxBytes) {
+    const buf = Buffer.from(remaining, 'utf8');
+    let cut = maxBytes;
+    // 避免切断多字节 UTF-8 字符（续字节特征 10xxxxxx）
+    while (cut > 0 && (buf[cut] & 0xc0) === 0x80) cut--;
+    if (cut === 0) cut = maxBytes;
+    let piece = buf.subarray(0, cut).toString('utf8');
+    // 优先在换行处切分，避免截断代码行或 JSON
+    const lastNl = piece.lastIndexOf('\n');
+    if (lastNl > piece.length * 0.6) {
+      piece = piece.slice(0, lastNl + 1);
+    }
+    chunks.push(piece);
+    remaining = remaining.slice(piece.length);
+  }
+  if (remaining) chunks.push(remaining);
+  return chunks;
+}
 
 function truncateUtf8Bytes(str, maxBytes) {
   if (Buffer.byteLength(str, 'utf8') <= maxBytes) return str;
@@ -811,16 +835,12 @@ function formatMessagesForQuick(messages, tools, toolChoice, { startIndex = 0 } 
       const raw = typeof slice[0].content === 'string'
         ? slice[0].content
         : JSON.stringify(slice[0].content);
-      return truncateUtf8Bytes(raw, MAX_QUICK_PROMPT_BYTES);
+      return splitPromptIntoChunks(raw, '');
     }
-
-    // 针对增量/全量消息中的超长单条内容做预算分配，优先保证最后一条消息完整
-    const perOldMsgLimit = slice.length > 1 ? 6 * 1024 : MAX_QUICK_PROMPT_BYTES - 2048;
 
     for (let idx = 0; idx < slice.length; idx++) {
       const m = slice[idx];
-      const isLast = idx === slice.length - 1;
-      let text =
+      const text =
         typeof m.content === 'string'
           ? m.content
           : Array.isArray(m.content)
@@ -828,10 +848,6 @@ function formatMessagesForQuick(messages, tools, toolChoice, { startIndex = 0 } 
           : m.content == null
           ? ''
           : JSON.stringify(m.content);
-
-      if (!isLast && Buffer.byteLength(text, 'utf8') > perOldMsgLimit) {
-        text = truncateUtf8Bytes(text, perOldMsgLimit);
-      }
 
       if (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
         const callsText = m.tool_calls
@@ -866,30 +882,37 @@ function formatMessagesForQuick(messages, tools, toolChoice, { startIndex = 0 } 
     }
   }
 
-  if (toolSection) {
-    parts.push(toolSection);
+  return splitPromptIntoChunks(parts.join('\n\n'), toolSection);
+}
+
+function splitPromptIntoChunks(bodyText, toolSection) {
+  const full = toolSection ? `${bodyText}\n\n${toolSection}` : bodyText;
+  if (Buffer.byteLength(full, 'utf8') <= MAX_QUICK_PROMPT_BYTES) {
+    return [full];
   }
 
-  let joined = parts.join('\n\n');
-  if (Buffer.byteLength(joined, 'utf8') > MAX_QUICK_PROMPT_BYTES) {
-    // 若仍超限：优先保留最后一条用户/工具消息与工具协议尾，裁剪中间旧历史
-    if (parts.length >= 2) {
-      const tailParts = toolSection
-        ? [parts[parts.length - 2], toolSection]
-        : [parts[parts.length - 1]];
-      const tail = tailParts.join('\n\n');
-      if (Buffer.byteLength(tail, 'utf8') <= MAX_QUICK_PROMPT_BYTES) {
-        joined = `...[earlier history omitted due to size limit]...\n\n${tail}`;
-      } else {
-        joined = truncateUtf8Bytes(tail, MAX_QUICK_PROMPT_BYTES);
-      }
-    }
-    if (Buffer.byteLength(joined, 'utf8') > MAX_QUICK_PROMPT_BYTES) {
-      joined = truncateUtf8Bytes(joined, MAX_QUICK_PROMPT_BYTES);
-    }
+  // 为分片头部与末尾 toolSection 预留空间，避免单片超 42KB
+  const headerReserve = 160;
+  const toolBytes = toolSection ? Buffer.byteLength(toolSection, 'utf8') + 16 : 0;
+  const bodyMax = Math.max(8 * 1024, MAX_QUICK_PROMPT_BYTES - headerReserve - toolBytes);
+  let rawChunks = splitUtf8ByMaxBytes(bodyText, bodyMax);
+  if (rawChunks.length > MAX_PROMPT_CHUNKS) {
+    // 超过最大分片数时保留开头与末尾分片，避免无限耗时
+    rawChunks = [
+      rawChunks[0],
+      `...[omitted ${rawChunks.length - MAX_PROMPT_CHUNKS} middle part(s) exceeding max ${MAX_PROMPT_CHUNKS} chunks]...`,
+      ...rawChunks.slice(-(MAX_PROMPT_CHUNKS - 2)),
+    ];
   }
-
-  return joined;
+  const total = rawChunks.length;
+  return rawChunks.map((chunk, i) => {
+    const isLast = i === total - 1;
+    if (!isLast) {
+      return `[Message Part ${i + 1}/${total} - Read and store this part in context, then reply ONLY "ACK" without answering yet.]\n\n${chunk}`;
+    }
+    const finalBody = `[Message Part ${total}/${total} - Final part. Now respond to the full request across all parts.]\n\n${chunk}`;
+    return toolSection ? `${finalBody}\n\n${toolSection}` : finalBody;
+  });
 }
 
 function extractToolCallsFromText(text) {
@@ -2060,83 +2083,106 @@ async function runServeCommand(flags) {
 
     await ensureFreshCredentials(false);
     const rec = opts.sessionRec;
+    const chunks = Array.isArray(opts.promptChunks) && opts.promptChunks.length > 0
+      ? opts.promptChunks
+      : [opts.promptText];
 
-    // 浏览器扩展模式：若已有同一会话的活跃 WS 连接，直接复用该长连接发送本轮 user_message
-    if (rec?.activeWsSession?.isExtension && rec.activeWsSession.ws?.readyState === WebSocket.OPEN) {
-      const active = rec.activeWsSession;
-      logInfo('WS', `[${opts.reqId || '-'}] reusing active extension WS threadId=${opts.threadId} promptLen=${opts.promptText.length}`);
-      const payloadObj = {
-        type: 'user_message',
-        payload: {
-          thread_id: opts.threadId,
-          text: opts.promptText,
-          message_id: crypto.randomUUID(),
-          agent_mode: opts.agentMode || 'smart',
-          ...(opts.thinkingEffort && opts.thinkingEffort !== 'off' ? { thinking_effort: opts.thinkingEffort } : {}),
-        },
-      };
-      try {
-        active.ws.send(encodeOutboundByMode(active, payloadObj));
-        return await attachWsSessionTurn(active, {
-          reqId: opts.reqId,
-          clientTools: opts.clientTools,
-          signal: opts.signal,
-          onThought: opts.onThought,
-          onDelta: opts.onDelta,
-        });
-      } catch (err) {
-        logInfo('WS', `[${opts.reqId || '-'}] active extension WS failed (${err.message}), reconnecting...`);
-        await closeWsSession(active, true);
+    const sendSinglePrompt = async (chunkText, isFinalChunk) => {
+      const turnOpts = isFinalChunk
+        ? { ...opts, promptText: chunkText }
+        : {
+            ...opts,
+            promptText: chunkText,
+            clientTools: undefined,
+            onThought: undefined,
+            onDelta: undefined,
+          };
+
+      // 浏览器扩展模式：若已有同一会话的活跃 WS 连接，直接复用该长连接发送本轮 user_message
+      if (rec?.activeWsSession?.isExtension && rec.activeWsSession.ws?.readyState === WebSocket.OPEN) {
+        const active = rec.activeWsSession;
+        logInfo('WS', `[${opts.reqId || '-'}] reusing active extension WS threadId=${opts.threadId} promptLen=${chunkText.length}`);
+        const payloadObj = {
+          type: 'user_message',
+          payload: {
+            thread_id: opts.threadId,
+            text: chunkText,
+            message_id: crypto.randomUUID(),
+            agent_mode: opts.agentMode || 'smart',
+            ...(opts.thinkingEffort && opts.thinkingEffort !== 'off' ? { thinking_effort: opts.thinkingEffort } : {}),
+          },
+        };
+        try {
+          active.ws.send(encodeOutboundByMode(active, payloadObj));
+          return await attachWsSessionTurn(active, {
+            reqId: opts.reqId,
+            clientTools: turnOpts.clientTools,
+            signal: opts.signal,
+            onThought: turnOpts.onThought,
+            onDelta: turnOpts.onDelta,
+          });
+        } catch (err) {
+          logInfo('WS', `[${opts.reqId || '-'}] active extension WS failed (${err.message}), reconnecting...`);
+          await closeWsSession(active, true);
+          rec.activeWsSession = null;
+        }
+      } else if (rec?.activeWsSession) {
+        await closeWsSession(rec.activeWsSession, true);
         rec.activeWsSession = null;
       }
-    } else if (rec?.activeWsSession) {
-      await closeWsSession(rec.activeWsSession, true);
-      rec.activeWsSession = null;
-    }
 
-    if (creds.provider === 'extension') {
-      await sessionManager.acquireWsSlot(rec);
-    }
+      if (creds.provider === 'extension') {
+        await sessionManager.acquireWsSlot(rec);
+      }
 
-    const runNewTurn = async () =>
-      callQuickWsTurn({
-        ...creds,
-        ...opts,
-        workingSessionId: rec?.workingSessionId || opts.workingSessionId,
-        onSessionCreated: (s) => {
-          if (rec && s.isExtension) rec.activeWsSession = s;
-        },
-      });
+      const runNewTurn = async () =>
+        callQuickWsTurn({
+          ...creds,
+          ...turnOpts,
+          workingSessionId: rec?.workingSessionId || opts.workingSessionId,
+          onSessionCreated: (s) => {
+            if (rec && s.isExtension) rec.activeWsSession = s;
+          },
+        });
 
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        return await runNewTurn();
-      } catch (err) {
-        const msg = String(err?.message || '');
-        if (isAuthError(err) && creds.cookie && attempt === 0) {
-          await ensureFreshCredentials(true);
-          continue;
-        }
-        if (
-          creds.provider === 'extension' &&
-          (msg.includes('limitExceededException') || msg.includes('Tenant service stream error')) &&
-          attempt < 2
-        ) {
-          if (msg.includes('Too many active connections')) {
-            const evicted = await sessionManager.evictOldestIdleWs(rec);
-            if (!evicted) await new Promise((r) => setTimeout(r, 800));
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          return await runNewTurn();
+        } catch (err) {
+          const msg = String(err?.message || '');
+          if (isAuthError(err) && creds.cookie && attempt === 0) {
+            await ensureFreshCredentials(true);
             continue;
           }
-          if (rec) {
-            rec.workingSessionId = crypto.randomUUID();
-            rec.activeWsSession = null;
+          if (
+            creds.provider === 'extension' &&
+            (msg.includes('limitExceededException') || msg.includes('Tenant service stream error')) &&
+            attempt < 2
+          ) {
+            if (msg.includes('Too many active connections')) {
+              const evicted = await sessionManager.evictOldestIdleWs(rec);
+              if (!evicted) await new Promise((r) => setTimeout(r, 800));
+              continue;
+            }
+            if (rec) {
+              rec.workingSessionId = crypto.randomUUID();
+              rec.activeWsSession = null;
+            }
+            await new Promise((r) => setTimeout(r, 500));
+            continue;
           }
-          await new Promise((r) => setTimeout(r, 500));
-          continue;
+          throw err;
         }
-        throw err;
       }
+    };
+
+    if (chunks.length > 1) {
+      logInfo('WS', `[${opts.reqId || '-'}] splitting oversized prompt into ${chunks.length} messages`);
     }
+    for (let i = 0; i < chunks.length - 1; i++) {
+      await sendSinglePrompt(chunks[i], false);
+    }
+    return await sendSinglePrompt(chunks[chunks.length - 1], true);
   }
 
   const server = http.createServer(async (req, res) => {
@@ -2218,12 +2264,14 @@ async function runServeCommand(flags) {
       const totalMsgs = Array.isArray(body.messages) ? body.messages.length : 0;
       const msgHashes = (Array.isArray(body.messages) ? body.messages : []).map(hashMessage);
       const { rec: sessionRec, startIndex, isFork } = sessionManager.resolveSession(req, body);
-      const promptText = formatMessagesForQuick(body.messages, body.tools, body.tool_choice, {
+      const promptChunks = formatMessagesForQuick(body.messages, body.tools, body.tool_choice, {
         startIndex,
       });
+      const promptText = promptChunks[promptChunks.length - 1] || '';
+      const totalPromptBytes = promptChunks.reduce((acc, c) => acc + Buffer.byteLength(c, 'utf8'), 0);
       logInfo(
         'CHAT',
-        `[${reqId}] session=${sessionRec.sessionKey} thread=${sessionRec.threadId} fork=${isFork} model=${reqModel} mode=${agentMode} effort=${thinkingEffort} stream=${isStream} tools=${hasTools ? body.tools.length : 0} msgs=${totalMsgs} startIdx=${startIndex} promptBytes=${Buffer.byteLength(promptText, 'utf8')}`
+        `[${reqId}] session=${sessionRec.sessionKey} thread=${sessionRec.threadId} fork=${isFork} model=${reqModel} mode=${agentMode} effort=${thinkingEffort} stream=${isStream} tools=${hasTools ? body.tools.length : 0} msgs=${totalMsgs} startIdx=${startIndex} chunks=${promptChunks.length} promptBytes=${totalPromptBytes}`
       );
 
       const ac = new AbortController();
@@ -2279,6 +2327,7 @@ async function runServeCommand(flags) {
                 clientTools: body.tools,
                 messages: body.messages,
                 promptText,
+                promptChunks,
                 signal: ac.signal,
                 onThought: (t) => writeChunk({ reasoning_content: t }),
                 onDelta: (d) => filter.push(d),
@@ -2303,6 +2352,7 @@ async function runServeCommand(flags) {
                 thinkingEffort,
                 messages: body.messages,
                 promptText,
+                promptChunks,
                 signal: ac.signal,
                 onThought: (t) => writeChunk({ reasoning_content: t }),
                 onDelta: (d) => writeChunk({ content: d }),
@@ -2336,6 +2386,7 @@ async function runServeCommand(flags) {
             clientTools: body.tools,
             messages: body.messages,
             promptText,
+            promptChunks,
             signal: ac.signal,
           })
         );
