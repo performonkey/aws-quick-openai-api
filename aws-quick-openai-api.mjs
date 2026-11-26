@@ -749,6 +749,7 @@ function formatMessagesForQuick(messages, tools, toolChoice, { startIndex = 0 } 
   const isIncremental = startIndex > 0;
   const hasTools = Array.isArray(tools) && tools.length > 0;
 
+  let toolSection = '';
   if (hasTools && !isIncremental) {
     // 精简工具定义，保留名称、简介、参数名与必填项以降低体积
     const toolDefs = tools.map((t) => {
@@ -770,21 +771,17 @@ function formatMessagesForQuick(messages, tools, toolChoice, { startIndex = 0 } 
         ? 'Select and invoke one of the client functions below to proceed.'
         : typeof toolChoice === 'object' && toolChoice?.function?.name
         ? `Invoke the "${toolChoice.function.name}" client function below.`
-        : 'When you need to read/write workspace files, search code, or run commands, invoke the appropriate client function below.';
+        : 'When the task involves local files, codebases, or commands, call these client functions instead of saying you lack local access.';
 
-    parts.push(
-      [
-        'Workspace environment: The user is interacting through a local editor client that executes client-side functions on the workspace.',
-        choiceHint,
-        `To call a client function, output the tag directly (outside markdown code blocks): ${TOOL_CALL_OPEN}{"name":"<name>","arguments":{...}}${TOOL_CALL_CLOSE}`,
-        'Stop after outputting the tag(s) and wait for the Tool output message.',
-        `Client functions: ${JSON.stringify(toolDefs)}`,
-      ].join('\n')
-    );
+    toolSection = [
+      '[Client Functions]',
+      'The user is using a local client that executes the following functions in their local workspace and returns the output to you.',
+      choiceHint,
+      `Call format (output the tag directly outside code blocks, then stop and wait for Tool output): ${TOOL_CALL_OPEN}{"name":"<name>","arguments":{...}}${TOOL_CALL_CLOSE}`,
+      `Functions: ${JSON.stringify(toolDefs)}`,
+    ].join('\n');
   } else if (hasTools && isIncremental) {
-    parts.push(
-      `[Client functions remain available via ${TOOL_CALL_OPEN}{"name":"<name>","arguments":{...}}${TOOL_CALL_CLOSE}]`
-    );
+    toolSection = `[Client Functions Active: use ${TOOL_CALL_OPEN}{"name":"<name>","arguments":{...}}${TOOL_CALL_CLOSE} directly for local workspace actions instead of saying you lack local access.]`;
   }
 
   const allMsgs = Array.isArray(messages) ? messages : [];
@@ -849,15 +846,23 @@ function formatMessagesForQuick(messages, tools, toolChoice, { startIndex = 0 } 
     }
   }
 
+  if (toolSection) {
+    parts.push(toolSection);
+  }
+
   let joined = parts.join('\n\n');
   if (Buffer.byteLength(joined, 'utf8') > MAX_QUICK_PROMPT_BYTES) {
-    // 若仍超限：优先保留工具协议头（若有）与最后一条消息，裁剪中间旧历史
+    // 若仍超限：优先保留最后一条用户/工具消息与工具协议尾，裁剪中间旧历史
     if (parts.length >= 2) {
-      const head = Array.isArray(tools) && tools.length > 0 && !isIncremental ? parts[0] : '';
-      const tail = parts[parts.length - 1];
-      const budgetForTail = MAX_QUICK_PROMPT_BYTES - (head ? Buffer.byteLength(head, 'utf8') + 64 : 0);
-      const safeTail = truncateUtf8Bytes(tail, Math.max(4096, budgetForTail));
-      joined = head ? `${head}\n\n...[earlier history omitted due to size limit]...\n\n${safeTail}` : safeTail;
+      const tailParts = toolSection
+        ? [parts[parts.length - 2], toolSection]
+        : [parts[parts.length - 1]];
+      const tail = tailParts.join('\n\n');
+      if (Buffer.byteLength(tail, 'utf8') <= MAX_QUICK_PROMPT_BYTES) {
+        joined = `...[earlier history omitted due to size limit]...\n\n${tail}`;
+      } else {
+        joined = truncateUtf8Bytes(tail, MAX_QUICK_PROMPT_BYTES);
+      }
     }
     if (Buffer.byteLength(joined, 'utf8') > MAX_QUICK_PROMPT_BYTES) {
       joined = truncateUtf8Bytes(joined, MAX_QUICK_PROMPT_BYTES);
