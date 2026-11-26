@@ -15,8 +15,8 @@ import { fileURLToPath } from 'node:url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const DEFAULT_CREDS_FILE = path.resolve(__dirname, './openai-creds.json');
-const DEFAULT_SESSIONS_FILE = path.resolve(process.cwd(), './openai-sessions.json');
+const DEFAULT_CREDS_FILE = path.resolve(__dirname, './creds.json');
+const DEFAULT_SESSIONS_FILE = path.resolve(process.cwd(), './sessions.json');
 const EXT_VERSION = '1.0.13657.0';
 const EXT_REFRESH_INTERVAL_SEC = 50 * 60; // 对齐 ext/background.js 每 50 分钟刷新一次
 
@@ -668,7 +668,7 @@ function saveCredsToFile(filePath, creds) {
     usableUntil: creds.usableUntil ?? null,
     updatedAt: new Date().toISOString(),
   };
-  const tmpPath = path.join(dir, `.openai-creds-${crypto.randomBytes(6).toString('hex')}.tmp`);
+  const tmpPath = path.join(dir, `.creds-${crypto.randomBytes(6).toString('hex')}.tmp`);
   fs.writeFileSync(tmpPath, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
   fs.renameSync(tmpPath, filePath);
 }
@@ -1030,9 +1030,14 @@ function hashesMatchPrefix(prefix, full) {
  * - 当客户端基于同一历史节点 Fork 出不同分支时，自动派生新 threadId 隔离上下文
  * - 同一会话内顺序排队，不同会话/分支之间完全并发
  */
+const MAX_ACTIVE_WS = 3;
+const WS_IDLE_CLOSE_MS = 120 * 1000;
+
 class SessionManager {
   #persistDirty = false;
   #persistWriting = false;
+  #wsWaiters = [];
+  #slotChain = Promise.resolve();
 
   constructor(ttlMs = 30 * 60 * 1000, persistFile = '') {
     this.ttlMs = ttlMs;
@@ -1245,15 +1250,116 @@ class SessionManager {
   }
 
   /**
+   * 统计当前活跃（OPEN / CONNECTING）的 WebSocket 连接数
+   */
+  countActiveWs() {
+    const seen = new Set();
+    let count = 0;
+    for (const r of this.sessions.values()) {
+      const ws = r.activeWsSession?.ws;
+      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+        seen.add(ws);
+        count++;
+      }
+    }
+    for (const s of pendingToolSessions.values()) {
+      const ws = s?.ws;
+      if (ws && !seen.has(ws) && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+        seen.add(ws);
+        count++;
+      }
+    }
+    return count;
+  }
+
+  /**
+   * 驱逐最久未使用的空闲 WS 连接（inFlight === 0）并等待其关闭
+   */
+  async evictOldestIdleWs(excludeRec = null) {
+    const candidates = [...this.sessions.values()]
+      .filter(
+        (r) =>
+          r !== excludeRec &&
+          r.inFlight === 0 &&
+          r.activeWsSession?.ws &&
+          (r.activeWsSession.ws.readyState === WebSocket.OPEN ||
+            r.activeWsSession.ws.readyState === WebSocket.CONNECTING)
+      )
+      .sort((a, b) => a.lastActiveAt - b.lastActiveAt);
+
+    if (candidates.length === 0) return false;
+    const victim = candidates[0];
+    const wsSession = victim.activeWsSession;
+    victim.activeWsSession = null;
+    logInfo('WS', `Evicting idle extension WS session=${victim.sessionKey} to free connection slot`);
+    await closeWsSession(wsSession, true);
+    await new Promise((r) => setTimeout(r, 300));
+    return true;
+  }
+
+  notifyWsWaiters() {
+    while (this.#wsWaiters.length > 0) {
+      const hasFreeSlot = this.countActiveWs() < MAX_ACTIVE_WS;
+      const hasIdleToEvict = [...this.sessions.values()].some(
+        (r) =>
+          r.inFlight === 0 &&
+          r.activeWsSession?.ws &&
+          (r.activeWsSession.ws.readyState === WebSocket.OPEN ||
+            r.activeWsSession.ws.readyState === WebSocket.CONNECTING)
+      );
+      if (!hasFreeSlot && !hasIdleToEvict) break;
+      const wake = this.#wsWaiters.shift();
+      wake?.();
+    }
+  }
+
+  /**
+   * 申请一个 WS 连接槽位（全局最多 MAX_ACTIVE_WS=3 个活跃连接）：
+   * - 若已达上限，优先驱逐最久未使用的空闲 WS 连接
+   * - 若全部连接都在请求处理中，排队等待任一请求释放槽位
+   */
+  acquireWsSlot(currentRec = null) {
+    const run = this.#slotChain.then(async () => {
+      while (this.countActiveWs() >= MAX_ACTIVE_WS) {
+        const evicted = await this.evictOldestIdleWs(currentRec);
+        if (evicted) continue;
+        logInfo('WS', `Active WS connections reached limit (${MAX_ACTIVE_WS}), waiting for a free slot...`);
+        await new Promise((resolve) => {
+          this.#wsWaiters.push(resolve);
+        });
+      }
+    });
+    this.#slotChain = run.catch(() => {});
+    return run;
+  }
+
+  /**
    * 同一 sessionKey 内的请求串行排队；不同 sessionKey 之间完全并行
    */
   enqueue(rec, taskFn) {
     rec.inFlight += 1;
+    if (rec.activeWsSession?.idleCloseTimer) {
+      clearTimeout(rec.activeWsSession.idleCloseTimer);
+      rec.activeWsSession.idleCloseTimer = null;
+    }
     const run = rec.queue.then(() => taskFn(rec), () => taskFn(rec));
     rec.queue = run.catch(() => {});
     return run.finally(() => {
       rec.inFlight = Math.max(0, rec.inFlight - 1);
+      if (rec.inFlight === 0 && rec.activeWsSession?.isExtension) {
+        if (rec.activeWsSession.idleCloseTimer) clearTimeout(rec.activeWsSession.idleCloseTimer);
+        rec.activeWsSession.idleCloseTimer = setTimeout(() => {
+          if (rec.inFlight === 0 && rec.activeWsSession) {
+            const s = rec.activeWsSession;
+            rec.activeWsSession = null;
+            void closeWsSession(s, false);
+            this.notifyWsWaiters();
+          }
+        }, WS_IDLE_CLOSE_MS);
+        rec.activeWsSession.idleCloseTimer.unref?.();
+      }
       this.touch(rec);
+      this.notifyWsWaiters();
     });
   }
 
@@ -1332,8 +1438,8 @@ function decodeInboundByMode(sessionState, bytes) {
   return decodeGatewayFrame(bytes);
 }
 
-function closeWsSession(sessionState) {
-  if (!sessionState) return;
+function closeWsSession(sessionState, waitClose = false) {
+  if (!sessionState) return Promise.resolve();
   if (sessionState.keepaliveTimer) {
     clearInterval(sessionState.keepaliveTimer);
     sessionState.keepaliveTimer = null;
@@ -1342,11 +1448,35 @@ function closeWsSession(sessionState) {
     clearTimeout(sessionState.ttlTimer);
     sessionState.ttlTimer = null;
   }
-  try {
-    sessionState.ws?.close(1000, 'done');
-  } catch {
-    // ignore
+  if (sessionState.idleCloseTimer) {
+    clearTimeout(sessionState.idleCloseTimer);
+    sessionState.idleCloseTimer = null;
   }
+  const ws = sessionState.ws;
+  if (!ws || ws.readyState === WebSocket.CLOSED) return Promise.resolve();
+
+  const waitPromise = waitClose
+    ? new Promise((resolve) => {
+        let done = false;
+        const finish = () => {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          ws.removeEventListener('close', finish);
+          resolve();
+        };
+        const timer = setTimeout(finish, 1500);
+        timer.unref?.();
+        ws.addEventListener('close', finish, { once: true });
+      })
+    : Promise.resolve();
+
+  try {
+    ws.close(1000, 'done');
+  } catch {
+    return Promise.resolve();
+  }
+  return waitPromise;
 }
 
 function attachWsSessionTurn(sessionState, { reqId = '-', clientTools, signal, onThought, onDelta }) {
@@ -1798,7 +1928,7 @@ async function runServeCommand(flags) {
         process.stderr.write(
           `Error: No credentials found in ${credsFile}.\n` +
             `Please sign in at: ${loginUrl}\n` +
-            `Then run: node quick-openai.mjs creds\n`
+            `Then run: node aws-quick-openai-api.mjs creds\n`
         );
         process.exit(1);
       }
@@ -1815,7 +1945,7 @@ async function runServeCommand(flags) {
     process.stderr.write(`[quick-openai] Credentials saved to ${credsFile}\n`);
   } else if (creds.provider !== 'extension' && (!creds.jwt || (!creds.wsHost && !creds.tenantUrl))) {
     process.stderr.write(
-      'Error: Missing Quick credentials. Run `node quick-openai.mjs creds` first.\n'
+      'Error: Missing Quick credentials. Run `node aws-quick-openai-api.mjs creds` first.\n'
     );
     process.exit(1);
   } else if (!fileCreds && flags['no-save'] !== 'true') {
@@ -1840,7 +1970,7 @@ async function runServeCommand(flags) {
     refreshPromise = (async () => {
       if (!creds.cookie) {
         const loginUrl = buildExtensionLoginUrl({ region: creds.region, accountAlias: creds.accountAlias });
-        throw new Error(`Cannot refresh without Cookie. Please sign in again at ${loginUrl} and run \`node quick-openai.mjs creds\`.`);
+        throw new Error(`Cannot refresh without Cookie. Please sign in again at ${loginUrl} and run \`node aws-quick-openai-api.mjs creds\`.`);
       }
       logInfo('AUTH', `Token ${force ? 'rejected/invalid' : 'expired or expiring soon'}, refreshing csrfToken via /sn/start...`);
       const fresh = await fetchExtensionConfigWithCookie({
@@ -1923,12 +2053,16 @@ async function runServeCommand(flags) {
         });
       } catch (err) {
         logInfo('WS', `[${opts.reqId || '-'}] active extension WS failed (${err.message}), reconnecting...`);
-        closeWsSession(active);
+        await closeWsSession(active, true);
         rec.activeWsSession = null;
       }
     } else if (rec?.activeWsSession) {
-      closeWsSession(rec.activeWsSession);
+      await closeWsSession(rec.activeWsSession, true);
       rec.activeWsSession = null;
+    }
+
+    if (creds.provider === 'extension') {
+      await sessionManager.acquireWsSlot(rec);
     }
 
     const runNewTurn = async () =>
@@ -1941,24 +2075,34 @@ async function runServeCommand(flags) {
         },
       });
 
-    try {
-      return await runNewTurn();
-    } catch (err) {
-      if (isAuthError(err) && creds.cookie) {
-        await ensureFreshCredentials(true);
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
         return await runNewTurn();
+      } catch (err) {
+        const msg = String(err?.message || '');
+        if (isAuthError(err) && creds.cookie && attempt === 0) {
+          await ensureFreshCredentials(true);
+          continue;
+        }
+        if (
+          creds.provider === 'extension' &&
+          (msg.includes('limitExceededException') || msg.includes('Tenant service stream error')) &&
+          attempt < 2
+        ) {
+          if (msg.includes('Too many active connections')) {
+            const evicted = await sessionManager.evictOldestIdleWs(rec);
+            if (!evicted) await new Promise((r) => setTimeout(r, 800));
+            continue;
+          }
+          if (rec) {
+            rec.workingSessionId = crypto.randomUUID();
+            rec.activeWsSession = null;
+          }
+          await new Promise((r) => setTimeout(r, 500));
+          continue;
+        }
+        throw err;
       }
-      if (
-        creds.provider === 'extension' &&
-        String(err?.message || '').includes('limitExceededException') &&
-        rec
-      ) {
-        // 旧 WS 通道在服务端尚未释放时，更换新的 WS conversationId 通道继续同一 threadId 对话
-        rec.workingSessionId = crypto.randomUUID();
-        rec.activeWsSession = null;
-        return await runNewTurn();
-      }
-      throw err;
     }
   }
 
@@ -2251,19 +2395,19 @@ function printHelp() {
   process.stdout.write(`quick-openai - AWS Quick 浏览器扩展凭证获取与 OpenAI Compatible API 代理 (纯 Node.js 标准库)
 
 Usage:
-  node quick-openai.mjs creds [--region us-east-1] [--alias <dir>] [--cookie <cookie>] [--relogin] [--creds-file <path>]
-  node quick-openai.mjs serve [--host 127.0.0.1] [--port 8080] [--creds-file <path>] [--sessions-file <path>] [--api-key <key>] [--debug]
+  node aws-quick-openai-api.mjs creds [--region us-east-1] [--alias <dir>] [--cookie <cookie>] [--relogin] [--creds-file <path>]
+  node aws-quick-openai-api.mjs serve [--host 127.0.0.1] [--port 8080] [--creds-file <path>] [--sessions-file <path>] [--api-key <key>] [--debug]
 
 Options:
-  --creds-file      凭证 JSON 路径（默认 ./openai-creds.json）
-  --sessions-file   会话持久化 JSON 路径（默认 ./openai-sessions.json）
+  --creds-file      凭证 JSON 路径（默认 ./creds.json）
+  --sessions-file   会话持久化 JSON 路径（默认 ./sessions.json）
 
 Env vars for "serve":
   OPENAI_API_KEY    (可选) 保护本地 OpenAI API 的 Bearer key
 
 Example:
-  node quick-openai.mjs creds
-  node quick-openai.mjs serve --port 8080
+  node aws-quick-openai-api.mjs creds
+  node aws-quick-openai-api.mjs serve --port 8080
 `);
 }
 

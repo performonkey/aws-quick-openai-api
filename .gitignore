@@ -5,6 +5,6 @@
 node_modules
 package.json
 .DS_Store
-openai-creds.json
-openai-sessions.json
+creds.json
+sessions.json
 *.tmp
