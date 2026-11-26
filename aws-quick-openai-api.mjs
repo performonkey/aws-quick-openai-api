@@ -809,26 +809,7 @@ function formatMessagesForQuick(messages, tools, toolChoice, { startIndex = 0 } 
   }
 
   const allMsgs = Array.isArray(messages) ? messages : [];
-  let slice = allMsgs.slice(startIndex);
-
-  // 从已跳过的 assistant.tool_calls 提取 tool_call_id -> name 映射，方便 tool 输出标注工具名
-  const toolNameById = new Map();
-  for (const m of allMsgs) {
-    if (m?.role === 'assistant' && Array.isArray(m.tool_calls)) {
-      for (const tc of m.tool_calls) {
-        if (tc?.id && tc?.function?.name) {
-          toolNameById.set(tc.id, tc.function.name);
-        }
-      }
-    }
-  }
-
-  if (isIncremental) {
-    // 云端 thread_id 已保留上一轮模型回复，增量请求时无需重复回传紧邻的 assistant 输出
-    while (slice.length > 1 && slice[0]?.role === 'assistant') {
-      slice = slice.slice(1);
-    }
-  }
+  const slice = allMsgs.slice(startIndex);
 
   if (slice.length > 0) {
     if (allMsgs.length === 1 && slice[0].role === 'user' && (!tools || tools.length === 0)) {
@@ -870,8 +851,7 @@ function formatMessagesForQuick(messages, tools, toolChoice, { startIndex = 0 } 
           .join('\n');
         parts.push(`Assistant: ${text ? `${text}\n` : ''}${callsText}`);
       } else if (m.role === 'tool') {
-        const toolLabel = m.name || toolNameById.get(m.tool_call_id) || m.tool_call_id || 'tool';
-        parts.push(`Tool output (${toolLabel}):\n${text}`);
+        parts.push(`Tool output (${m.name || m.tool_call_id || 'tool'}):\n${text}`);
       } else if (m.role === 'system' || m.role === 'developer') {
         parts.push(`Context: ${text}`);
       } else if (m.role === 'assistant') {
