@@ -773,6 +773,24 @@ function formatMessagesForQuick(messages, tools, toolChoice, { startIndex = 0 } 
   const isIncremental = startIndex > 0;
   const hasTools = Array.isArray(tools) && tools.length > 0;
 
+  if (!isIncremental) {
+    parts.push(
+      [
+        '[Session Environment: Local Client Tool Bridge]',
+        'Although your inference runs in the cloud, this session is connected through a local OpenAI-compatible client proxy (CLI / IDE / DSH) running directly on the user\'s machine.',
+        'Because the local client proxy bridges your responses to the user\'s device, cloud-only workspace assumptions (such as being unable to access the user\'s computer, local folders, or local shell) do not apply here.',
+        'Do NOT use your cloud sandbox workspace, "Agent Files", or cloud web search for local project tasks, and do NOT ask the user to switch to the desktop app or run commands manually.',
+        'Format your response in standard Markdown only; do NOT emit Quick-specific UI tags such as <sources>, <decisions>, <decision>, <option>, or <artifact>.',
+        ...(hasTools
+          ? [
+              `Whenever you need to inspect local directories/files, edit local code, or run local commands/package installs on the user's machine, invoke the client functions listed at the end of this prompt using ${TOOL_CALL_OPEN}{"name":"<name>","arguments":{...}}${TOOL_CALL_CLOSE}.`,
+              'The local client proxy executes each <qw_tool_call> on the user\'s device and sends the result back to you in the next Tool output message.',
+            ]
+          : []),
+      ].join('\n')
+    );
+  }
+
   let toolSection = '';
   if (hasTools && !isIncremental) {
     // 精简工具定义，保留名称、简介、参数名与必填项以降低体积
@@ -831,7 +849,7 @@ function formatMessagesForQuick(messages, tools, toolChoice, { startIndex = 0 } 
   }
 
   if (slice.length > 0) {
-    if (allMsgs.length === 1 && slice[0].role === 'user' && (!tools || tools.length === 0)) {
+    if (allMsgs.length === 1 && slice[0].role === 'user' && !hasTools && isIncremental) {
       const raw = typeof slice[0].content === 'string'
         ? slice[0].content
         : JSON.stringify(slice[0].content);
@@ -951,15 +969,95 @@ function extractToolCallsFromText(text) {
   return { toolCalls, cleanText };
 }
 
+function parseXmlAttrs(attrStr = '') {
+  const attrs = {};
+  const re = /([a-zA-Z0-9_-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
+  let m;
+  while ((m = re.exec(attrStr)) !== null) {
+    attrs[m[1]] = m[2] ?? m[3] ?? '';
+  }
+  return attrs;
+}
+
+function formatSourcesToMarkdown(inner = '') {
+  const lines = inner
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  if (lines.length === 0) return '';
+  return [
+    '> **参考来源**',
+    ...lines.map((l) => (l.startsWith('- ') || l.startsWith('* ') ? `> ${l}` : `> - ${l}`)),
+  ].join('\n');
+}
+
+function formatSingleDecisionToMarkdown(attrsStr = '', inner = '') {
+  const attrs = parseXmlAttrs(attrsStr);
+  const question = attrs.question || '请选择';
+  const isMulti = attrs.multi === 'true';
+  const header = `**${question}**${isMulti ? '（可多选）' : ''}`;
+  const options = [];
+  const optRe = /<option\b([^>]*)>([\s\S]*?)<\/option>/gi;
+  let m;
+  while ((m = optRe.exec(inner)) !== null) {
+    const optAttrs = parseXmlAttrs(m[1]);
+    const label = m[2].trim();
+    const desc = (optAttrs.description || '').trim();
+    if (label && desc) options.push(`- **${label}**：${desc}`);
+    else if (label) options.push(`- **${label}**`);
+    else if (desc) options.push(`- ${desc}`);
+  }
+  return options.length > 0 ? `${header}\n${options.join('\n')}` : header;
+}
+
+function formatDecisionsToMarkdown(inner = '') {
+  const blocks = [];
+  const decRe = /<decision\b([^>]*)>([\s\S]*?)<\/decision>/gi;
+  let m;
+  while ((m = decRe.exec(inner)) !== null) {
+    blocks.push(formatSingleDecisionToMarkdown(m[1], m[2]));
+  }
+  if (blocks.length > 0) return blocks.join('\n\n');
+  return inner.trim();
+}
+
+function formatArtifactToMarkdown(attrsStr = '', inner = '') {
+  const attrs = parseXmlAttrs(attrsStr);
+  const lang = (attrs.type || 'html').trim() || 'html';
+  const title = attrs.title ? `**${attrs.title.trim()}**\n` : '';
+  return `${title}\`\`\`${lang}\n${inner.trim()}\n\`\`\``;
+}
+
+function convertQuickTagsToMarkdown(text) {
+  if (!text || typeof text !== 'string') return text || '';
+  return text
+    .replace(/<sources\b[^>]*>([\s\S]*?)<\/sources>/gi, (_, inner) => formatSourcesToMarkdown(inner))
+    .replace(/<decisions\b[^>]*>([\s\S]*?)<\/decisions>/gi, (_, inner) => formatDecisionsToMarkdown(inner))
+    .replace(/<decision\b([^>]*)>([\s\S]*?)<\/decision>/gi, (_, attrs, inner) => formatSingleDecisionToMarkdown(attrs, inner))
+    .replace(/<artifact\b([^>]*)>([\s\S]*?)<\/artifact>/gi, (_, attrs, inner) => formatArtifactToMarkdown(attrs, inner))
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
 /**
  * 实时流式标签过滤器：
- * - 普通文本不等待整轮结束，除末尾可能匹配 <qw_tool_call> 前缀的字符外全部实时推送
- * - 一旦遇到 <qw_tool_call>...</qw_tool_call>，静默缓冲并解析为 tool_calls 回调
+ * - 普通文本实时推送，除末尾可能匹配特殊标签前缀的字符外不阻塞
+ * - 拦截 <qw_tool_call>...</qw_tool_call> 并解析为 tool_calls 回调
+ * - 自动将 <sources>、<decisions>/<decision>、<artifact> 实时转换为标准 Markdown 格式
  */
 function createStreamingToolFilter({ onText, onToolCall }) {
   let buf = '';
-  let inTag = false;
+  let state = 'text'; // 'text' | 'tool' | 'sources' | 'decisions' | 'decision_head' | 'decision' | 'artifact_head' | 'artifact_body'
   let toolIndex = 0;
+  let decisionAttrs = '';
+
+  const TAG_PREFIXES = [
+    { prefix: TOOL_CALL_OPEN, type: 'tool', exact: true },
+    { prefix: '<sources>', type: 'sources', exact: true },
+    { prefix: '<decisions>', type: 'decisions', exact: true },
+    { prefix: '<decision', type: 'decision_head', exact: false },
+    { prefix: '<artifact', type: 'artifact_head', exact: false },
+  ];
 
   function longestPrefixOverlap(str, target) {
     const maxLen = Math.min(str.length, target.length - 1);
@@ -969,33 +1067,110 @@ function createStreamingToolFilter({ onText, onToolCall }) {
     return 0;
   }
 
-  function processBuffer() {
-    while (buf.length > 0) {
-      if (!inTag) {
-        const openIdx = buf.indexOf(TOOL_CALL_OPEN);
-        if (openIdx !== -1) {
-          if (openIdx > 0) onText(buf.slice(0, openIdx));
-          buf = buf.slice(openIdx + TOOL_CALL_OPEN.length);
-          inTag = true;
+  function findEarliestTag(str) {
+    let best = null;
+    for (const item of TAG_PREFIXES) {
+      const idx = str.indexOf(item.prefix);
+      if (idx === -1) continue;
+      if (!item.exact) {
+        const nextCh = str[idx + item.prefix.length];
+        if (nextCh !== undefined && nextCh !== ' ' && nextCh !== '>' && nextCh !== '\t' && nextCh !== '\n') {
           continue;
         }
-        const overlap = longestPrefixOverlap(buf, TOOL_CALL_OPEN);
-        const safeLen = buf.length - overlap;
+      }
+      if (!best || idx < best.idx) {
+        best = { idx, ...item };
+      }
+    }
+    return best;
+  }
+
+  function processBuffer() {
+    while (buf.length > 0) {
+      if (state === 'text') {
+        const hit = findEarliestTag(buf);
+        if (hit) {
+          if (hit.idx > 0) onText(buf.slice(0, hit.idx));
+          buf = buf.slice(hit.idx + hit.prefix.length);
+          if (hit.type === 'decision_head') {
+            const gt = buf.indexOf('>');
+            if (gt === -1) {
+              state = 'decision_head';
+              continue;
+            }
+            decisionAttrs = buf.slice(0, gt);
+            buf = buf.slice(gt + 1);
+            state = 'decision';
+          } else if (hit.type === 'artifact_head') {
+            const gt = buf.indexOf('>');
+            if (gt === -1) {
+              state = 'artifact_head';
+              continue;
+            }
+            const attrs = parseXmlAttrs(buf.slice(0, gt));
+            const lang = (attrs.type || 'html').trim() || 'html';
+            const title = attrs.title ? `**${attrs.title.trim()}**\n` : '';
+            onText(`${title}\`\`\`${lang}\n`);
+            buf = buf.slice(gt + 1);
+            state = 'artifact_body';
+          } else {
+            state = hit.type;
+          }
+          continue;
+        }
+        let maxOverlap = 0;
+        for (const item of TAG_PREFIXES) {
+          const ov = longestPrefixOverlap(buf, item.prefix);
+          if (ov > maxOverlap) maxOverlap = ov;
+        }
+        const safeLen = buf.length - maxOverlap;
         if (safeLen > 0) {
           onText(buf.slice(0, safeLen));
           buf = buf.slice(safeLen);
         }
         break;
-      } else {
+      } else if (state === 'decision_head') {
+        const gt = buf.indexOf('>');
+        if (gt === -1) break;
+        decisionAttrs = buf.slice(0, gt);
+        buf = buf.slice(gt + 1);
+        state = 'decision';
+      } else if (state === 'artifact_head') {
+        const gt = buf.indexOf('>');
+        if (gt === -1) break;
+        const attrs = parseXmlAttrs(buf.slice(0, gt));
+        const lang = (attrs.type || 'html').trim() || 'html';
+        const title = attrs.title ? `**${attrs.title.trim()}**\n` : '';
+        onText(`${title}\`\`\`${lang}\n`);
+        buf = buf.slice(gt + 1);
+        state = 'artifact_body';
+      } else if (state === 'artifact_body') {
+        const closeTag = '</artifact>';
+        const closeIdx = buf.indexOf(closeTag);
+        if (closeIdx !== -1) {
+          if (closeIdx > 0) onText(buf.slice(0, closeIdx).replace(/\n+$/, ''));
+          onText('\n```\n');
+          buf = buf.slice(closeIdx + closeTag.length);
+          state = 'text';
+          continue;
+        }
+        const ov = longestPrefixOverlap(buf, closeTag);
+        const safeLen = buf.length - ov;
+        if (safeLen > 0) {
+          onText(buf.slice(0, safeLen));
+          buf = buf.slice(safeLen);
+        }
+        break;
+      } else if (state === 'tool') {
         const closeIdx = buf.indexOf(TOOL_CALL_CLOSE);
         if (closeIdx === -1) break;
         const rawJson = buf.slice(0, closeIdx).trim();
         buf = buf.slice(closeIdx + TOOL_CALL_CLOSE.length);
-        inTag = false;
+        state = 'text';
         try {
           const parsed = JSON.parse(rawJson);
           if (parsed && typeof parsed.name === 'string') {
-            onToolCall({
+            onToolCall?.({
               index: toolIndex++,
               id: `call_${crypto.randomBytes(12).toString('hex')}`,
               type: 'function',
@@ -1011,6 +1186,30 @@ function createStreamingToolFilter({ onText, onToolCall }) {
         } catch {
           // 忽略格式错误的块
         }
+      } else {
+        const closeMap = {
+          sources: '</sources>',
+          decisions: '</decisions>',
+          decision: '</decision>',
+        };
+        const closeTag = closeMap[state];
+        const closeIdx = buf.indexOf(closeTag);
+        if (closeIdx === -1) break;
+        const inner = buf.slice(0, closeIdx);
+        buf = buf.slice(closeIdx + closeTag.length);
+        const curState = state;
+        state = 'text';
+        if (curState === 'sources') {
+          const md = formatSourcesToMarkdown(inner);
+          if (md) onText(md);
+        } else if (curState === 'decisions') {
+          const md = formatDecisionsToMarkdown(inner);
+          if (md) onText(md);
+        } else if (curState === 'decision') {
+          const md = formatSingleDecisionToMarkdown(decisionAttrs, inner);
+          decisionAttrs = '';
+          if (md) onText(md);
+        }
       }
     }
   }
@@ -1021,13 +1220,14 @@ function createStreamingToolFilter({ onText, onToolCall }) {
       processBuffer();
     },
     flush() {
-      if (!inTag && buf.length > 0) {
-        onText(buf);
-      } else if (inTag && buf.length > 0) {
-        onText(`${TOOL_CALL_OPEN}${buf}`);
+      if (buf.length > 0) {
+        if (state === 'text') onText(buf);
+        else if (state === 'artifact_body') onText(`${buf}\n\`\`\``);
+        else if (state === 'tool') onText(`${TOOL_CALL_OPEN}${buf}`);
+        else onText(buf);
       }
       buf = '';
-      inTag = false;
+      state = 'text';
     },
     getToolCount: () => toolIndex,
   };
@@ -2343,6 +2543,9 @@ async function runServeCommand(flags) {
               writeChunk({}, emittedToolCalls > 0 ? 'tool_calls' : 'stop');
               sessionManager.commitHashes(rec, msgHashes);
             } else {
+              const filter = createStreamingToolFilter({
+                onText: (t) => writeChunk({ content: t }),
+              });
               await callWithAutoRefresh({
                 reqId,
                 sessionRec: rec,
@@ -2355,8 +2558,9 @@ async function runServeCommand(flags) {
                 promptChunks,
                 signal: ac.signal,
                 onThought: (t) => writeChunk({ reasoning_content: t }),
-                onDelta: (d) => writeChunk({ content: d }),
+                onDelta: (d) => filter.push(d),
               });
+              filter.flush();
               writeChunk({}, 'stop');
               sessionManager.commitHashes(rec, msgHashes);
             }
@@ -2397,6 +2601,7 @@ async function runServeCommand(flags) {
           toolCalls = extracted.toolCalls;
           cleanText = extracted.cleanText;
         }
+        cleanText = convertQuickTagsToMarkdown(cleanText);
 
         res.setHeader('X-Quick-Session-Id', sessionRec.workingSessionId);
         res.setHeader('X-Quick-Thread-Id', sessionRec.threadId);
@@ -2411,7 +2616,7 @@ async function runServeCommand(flags) {
               index: 0,
               message: {
                 role: 'assistant',
-                content: toolCalls.length > 0 ? (cleanText || null) : result.text,
+                content: toolCalls.length > 0 ? (cleanText || null) : cleanText,
                 ...(toolCalls.length > 0
                   ? {
                       tool_calls: toolCalls.map(({ id, type, function: fn }) => ({
